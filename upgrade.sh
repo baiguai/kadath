@@ -1,113 +1,115 @@
 #!/bin/bash
 #
-# upgrade.sh - bump the FTXUI dependency to a newer release.
+# upgrade.sh - bump any FetchContent dependency to a newer release.
 #
-#   ./upgrade.sh              upgrade to the latest FTXUI release on GitHub
-#   ./upgrade.sh <tag>        pin a specific tag, e.g. ./upgrade.sh v5.0.0
+# Dependencies and their canonical variable names in CMakeLists.txt.in:
+#   imgui   -> IMGUI_VERSION
+#   glfw    -> GLFW_VERSION
+#   json    -> NLOHMANN_VERSION
+#
+# Usage:
+#   ./upgrade.sh                  upgrade ALL deps to their latest GitHub release
+#   ./upgrade.sh <dep>            upgrade <dep> to its latest release
+#   ./upgrade.sh <dep> <tag>      pin <dep> to a specific tag, e.g. ./upgrade.sh glfw 3.5.1
 #
 # What it does:
-#   - reads the current pin from CMakeLists.txt.in (the template build.sh uses)
+#   - reads the current pin from CMakeLists.txt.in (the template scripts use)
 #   - updates it to the chosen/latest tag
-#   - clears the cached FetchContent checkouts so the new tag is actually used
-#   - runs a configure pass to fetch the new tag and verify the local patch
-#     (patches/ftxui-c0-delivery.patch) still applies; on failure it rolls
-#     the template back to the previous pin
-#
-# FTXUI upgrades can break the app compile if its API changed - configure
-# passing here only means the patch applied; then run ./build.sh.
+#   - clears the cached FetchContent checkouts so the new tag is fetched next build
+#   - runs a configure pass to verify the new tag still fetches/compiles metadata
+#   - on failure it rolls the template back to the previous pin
 
 set -euo pipefail
 
-REPO="https://github.com/ArthurSonzogni/FTXUI.git"
+SH_REPO="https://github.com/ArthurSonzogni/FTXUI.git"
+IMGUI_REPO="https://github.com/ocornut/imgui.git"
+GLFW_REPO="https://github.com/glfw/glfw.git"
+JSON_REPO="https://github.com/nlohmann/json.git"
 TEMPLATE="CMakeLists.txt.in"
-PATCH="patches/ftxui-c0-delivery.patch"
 
 command -v git >/dev/null 2>&1 || { echo "ERROR: git is required."; exit 1; }
 [ -f "$TEMPLATE" ] || { echo "ERROR: $TEMPLATE not found. Run from the repo root."; exit 1; }
-[ -f "$PATCH" ] || { echo "ERROR: $PATCH not found."; exit 1; }
 
-CURRENT=$(grep -oP '^  GIT_TAG\s+\K\S+' "$TEMPLATE")
-echo "FTXUI currently pinned at: $CURRENT"
+TAG_SEP='[vV]?[0-9]+(\.[0-9]+)+$'
 
+latest_tag() { # $1 repo
+    git ls-remote --tags --refs "$1" 2>/dev/null \
+        | grep -oP "refs/tags/\K${TAG_SEP}" | sort -V | tail -1
+}
+
+# Name -> "VAR|repo|tag". Derived from the TEMPLATE variable even when the caller
+# passed an explicit tag, so we can report and roll back accurately.
+resolve_dep() { # $1 dep-name
+    local var repo
+    case "$1" in
+        imgui) var="IMGUI_VERSION"; repo="$IMGUI_REPO" ;;
+        glfw)  var="GLFW_VERSION";  repo="$GLFW_REPO" ;;
+        json)  var="NLOHMANN_VERSION"; repo="$JSON_REPO" ;;
+        *) echo "ERROR: unknown dependency '$1'. Use one of: imgui glfw json" >&2; exit 1 ;;
+    esac
+    echo "$var|$repo"
+}
+
+# Collect the deps to upgrade.
+DEPS=()
 if [ $# -ge 1 ]; then
-    TARGET="$1"
-    echo "Using requested tag: $TARGET"
-    git ls-remote --tags --refs "$REPO" | grep -q "refs/tags/$TARGET\$" \
-        || { echo "ERROR: tag '$TARGET' not found in $REPO."; exit 1; }
+    DEPS+=("$1")
 else
-    echo "Querying latest FTXUI release from GitHub..."
-    VER=$(git ls-remote --tags --refs "$REPO" \
-        | grep -oP 'refs/tags/\K[vV][0-9]+(\.[0-9]+)+$' \
-        | sort -V | tail -1)
-    [ -n "$VER" ] || { echo "ERROR: could not determine the latest FTXUI tag (network?)."; exit 1; }
-    TARGET="$VER"
+    DEPS=("imgui" "glfw" "json")
 fi
 
-if [ "$TARGET" = "$CURRENT" ]; then
-    echo "FTXUI is already at $TARGET - nothing to do."
-    exit 0
-fi
+REQUESTED_TAG="${2:-}"
 
-echo ""
-echo "Upgrading FTXUI: $CURRENT -> $TARGET"
-
-sed -i "s|^  GIT_TAG .*|  GIT_TAG $TARGET|" "$TEMPLATE"
-
-# Clear cached FetchContent checkouts so the new tag is fetched on next build
-for dep in build/_deps/ftxui-src build/_deps/ftxui-build \
-           build-windows/_deps/ftxui-src build-windows/_deps/ftxui-build; do
-    if [ -e "$dep" ]; then
-        rm -rf "$dep"
-        echo "Removed cached: $dep"
-    fi
-done
-
-# Regenerate CMakeLists.txt from the template (same as build.sh) and run a
-# configure pass to fetch the new tag and verify the patch still applies.
-echo ""
-echo "Verifying FTXUI $TARGET fetches and the patch applies..."
 source ./config.sh
-cp "$TEMPLATE" CMakeLists.txt
-sed -i "s/<<TARGET_NAME>>/$APP_NAME/g" CMakeLists.txt
-SOURCES_TMP=$(mktemp)
-for s in "${SOURCES[@]}"; do
-    echo "    $s" >> "$SOURCES_TMP"
-done
-sed -i "/^<<SOURCES>>$/{
-    r $SOURCES_TMP
-    d
-}" CMakeLists.txt
-rm -f "$SOURCES_TMP"
-for lib in "${LIBS[@]}"; do
-    if [[ "$lib" == *::* ]]; then
-        echo "target_link_libraries($APP_NAME PRIVATE $lib)" >> CMakeLists.txt
-    else
-        echo "target_link_libraries($APP_NAME PRIVATE \${CMAKE_SOURCE_DIR}/$lib)" >> CMakeLists.txt
-    fi
-done
+source ./generate-cmake.sh
 
-mkdir -p build
-if ! cmake -S . -B build; then
+for dep in "${DEPS[@]}"; do
+    IFS='|' read -r VAR REPO <<< "$(resolve_dep "$dep")"
+    CURRENT=$(grep -oP "^\s*set\(\Q$VAR\E\s+\K[^)]+" "$TEMPLATE" || true)
+    CURRENT="${CURRENT:-unknown}"
+
+    if [ -n "$REQUESTED_TAG" ]; then
+        TARGET="$REQUESTED_TAG"
+        git ls-remote --tags --refs "$REPO" | grep -q "refs/tags/$TARGET\$" \
+            || { echo "ERROR: tag '$TARGET' not found in $REPO." >&2; continue; }
+    else
+        echo "Querying latest $dep release from GitHub..."
+        TARGET=$(latest_tag "$REPO")
+        [ -n "$TARGET" ] || { echo "ERROR: could not determine the latest $dep tag (network?)." >&2; continue; }
+    fi
+
     echo ""
-    echo "ERROR: configure failed for FTXUI $TARGET."
-    echo "  The local patch ($PATCH) no longer applies cleanly."
+    echo "$dep currently pinned at: $CURRENT"
+    if [ "$TARGET" = "$CURRENT" ]; then
+        echo "$dep is already at $TARGET - nothing to do."
+        continue
+    fi
+    echo "Upgrading $dep: $CURRENT -> $TARGET"
+
+    sed -i "s/^set($VAR .*/set($VAR $TARGET)/" "$TEMPLATE"
+
+    # Clear cached FetchContent checkouts so the new tag is fetched next build
+    for b in build build-windows; do
+        rm -rf "$b/_deps/${dep}-src" "$b/_deps/${dep}-build" 2>/dev/null || true
+    done
+
+    # Regenerate CMakeLists.txt (same as build.sh) and run a configure pass to
+    # verify the new tag fetches and has the metadata we expect.
     echo ""
-    echo "  For FTXUI >= v6.0.0 the CAN/SUB fix is already upstream:"
-    echo "  Parse() returns SPECIAL for every C0 byte (incl. Ctrl+X/Ctrl+Z),"
-    echo "  so the patch is obsolete - remove the 'PATCH_COMMAND ...' line"
-    echo "  from $TEMPLATE and run ./upgrade.sh again."
-    echo ""
-    echo "  For older versions, re-baseline the patch against the new source"
-    echo "  and run ./upgrade.sh again."
-    echo ""
-    echo "  Rolling back the pin to $CURRENT..."
-    sed -i "s|^  GIT_TAG .*|  GIT_TAG $CURRENT|" "$TEMPLATE"
-    rm -rf build/_deps/ftxui-src build/_deps/ftxui-build
-    echo "Rolled back. Nothing was changed."
-    exit 1
-fi
+    echo "Verifying $dep $TARGET fetches..."
+    generate_cmake CMakeLists.txt
+    if ! cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/dev/null 2>&1; then
+        echo ""
+        echo "ERROR: configure failed for $dep $TARGET."
+        echo "  Rolling back the pin to $CURRENT..."
+        sed -i "s/^set($VAR .*/set($VAR $CURRENT)/" "$TEMPLATE"
+        generate_cmake CMakeLists.txt
+        rm -rf "build/_deps/${dep}-src" "build/_deps/${dep}-build"
+        echo "Rolled back. Nothing was changed."
+        continue
+    fi
+    echo "Done: $dep pinned to $TARGET ($TEMPLATE)."
+done
 
 echo ""
-echo "Done: FTXUI pinned to $TARGET ($TEMPLATE)."
-echo "Run ./build.sh to rebuild with the new FTXUI."
-    
+echo "All requested upgrades processed. Run ./build.sh to rebuild."

@@ -1,43 +1,126 @@
-cmake_minimum_required(VERSION 3.16)
-project(<<TARGET_NAME>> VERSION 1.0.0 LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.20)
+project(<<TARGET_NAME>> CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Create executable
-add_executable(<<TARGET_NAME>>
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+# A logically-correct-but-finnicky compositor suppression flag for minitray
+set(CMAKE_SUPPRESS_DEBUG_LABELS OFF)
+
+# ----------------------------------------------------------------------------
+# Dependencies (pinned; no system packages required)
+# ----------------------------------------------------------------------------
+include(FetchContent)
+
+set(IMGUI_VERSION v1.92.9)
+set(GLFW_VERSION 3.4)
+set(NLOHMANN_VERSION v3.12.0)
+
+FetchContent_Declare(
+    imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG        ${IMGUI_VERSION}
+    GIT_SHALLOW    TRUE
+)
+
+FetchContent_Declare(
+    glfw
+    GIT_REPOSITORY https://github.com/glfw/glfw.git
+    GIT_TAG        ${GLFW_VERSION}
+    GIT_SHALLOW    TRUE
+)
+
+FetchContent_Declare(
+    json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG        ${NLOHMANN_VERSION}
+    GIT_SHALLOW    TRUE
+)
+
+FetchContent_MakeAvailable(imgui glfw json)
+
+# ----------------------------------------------------------------------------
+# Target
+# ----------------------------------------------------------------------------
+add_executable(${PROJECT_NAME}
 <<SOURCES>>
 )
+target_include_directories(${PROJECT_NAME} PRIVATE src)
 
-include(FetchContent)
-FetchContent_Declare(ftxui
-  GIT_REPOSITORY https://github.com/ArthurSonzogni/FTXUI.git
-  GIT_TAG v5.0.0
-  PATCH_COMMAND git checkout -- . && git apply ${CMAKE_CURRENT_SOURCE_DIR}/patches/ftxui-c0-delivery.patch
+# Dear ImGui built as a static library directly from the fetched sources
+add_library(imgui STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/imgui_demo.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
 )
-FetchContent_MakeAvailable(ftxui)
+target_include_directories(imgui PUBLIC
+    ${imgui_SOURCE_DIR}
+    ${imgui_SOURCE_DIR}/backends
+)
+target_link_libraries(imgui PRIVATE glfw)
 
-# Platform-specific libraries
-if(UNIX AND NOT APPLE)
-    # Linux/X11
-    find_package(X11 REQUIRED)
-    target_link_libraries(<<TARGET_NAME>> PRIVATE X11::X11 X11::Xfixes)
+set_target_properties(imgui PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+target_link_libraries(${PROJECT_NAME} PRIVATE imgui glfw nlohmann_json::nlohmann_json)
+
+# ----------------------------------------------------------------------------
+# Headless tests (no imgui/glfw/clipboard/window - pure storage + keyboard logic)
+# ----------------------------------------------------------------------------
+enable_testing()
+add_executable(kadath_tests
+<<TESTSOURCES>>
+)
+target_include_directories(kadath_tests PRIVATE src "${imgui_SOURCE_DIR}")
+target_link_libraries(kadath_tests PRIVATE nlohmann_json::nlohmann_json glfw)
+add_test(NAME kadath_tests COMMAND kadath_tests)
+
+# ----------------------------------------------------------------------------
+# Platform dependencies
+# ----------------------------------------------------------------------------
+if(WIN32)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE _WIN32_WINNT=0x0601)
+    target_link_libraries(${PROJECT_NAME} PRIVATE user32 gdi32 opengl32)
 elseif(APPLE)
-    # macOS
-    find_library(COCOA Cocoa)
-    find_library(COREFOUNDATION CoreFoundation)
-    target_link_libraries(<<TARGET_NAME>> PRIVATE ${COCOA} ${COREFOUNDATION})
-elseif(WIN32)
-    # Windows
-    target_link_libraries(<<TARGET_NAME>> PRIVATE user32 kernel32 gdi32)
+    find_package(OpenGL REQUIRED)
+    target_link_libraries(${PROJECT_NAME} PRIVATE OpenGL::GL)
+    target_link_libraries(${PROJECT_NAME} PRIVATE "-framework Cocoa" "-framework IOKit" "-framework CoreVideo")
+else()
+    find_package(X11 REQUIRED)
+    find_package(OpenGL REQUIRED)
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+        X11::X11
+        X11::Xfixes
+        OpenGL::GL
+    )
+    find_package(Threads REQUIRED)
+    target_link_libraries(${PROJECT_NAME} PRIVATE Threads::Threads)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE _GNU_SOURCE)
 endif()
 
-# Compiler-specific options
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    target_compile_options(<<TARGET_NAME>> PRIVATE -Wall -Wextra -O2)
+source_group(TREE ${CMAKE_SOURCE_DIR} PREFIX "" FILES <<SOURCES>>)
+
+# ----------------------------------------------------------------------------
+# Windows subsystem + assets
+# ----------------------------------------------------------------------------
+if(WIN32)
+    set_target_properties(${PROJECT_NAME} PROPERTIES
+        WIN32_EXECUTABLE TRUE
+    )
 endif()
 
-# Set output directory
-set_target_properties(<<TARGET_NAME>> PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+# Make assets available next to the executable so the binary is portable
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_SOURCE_DIR}/assets"
+        "$<TARGET_FILE_DIR:${PROJECT_NAME}>/assets"
+    COMMENT "Copying assets/"
 )

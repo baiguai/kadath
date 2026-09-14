@@ -1,127 +1,183 @@
 #!/bin/bash
 #
-# app setup - checks prerequisites and prepares the FTXUI dependency.
+# setup.sh - checks prerequisites and prepares dependencies for kadath.
 #
-# Safe to run at any time; it does NOT assume a blank/fresh project and never
-# creates scaffolding. Optional flag:
-#   ./setup.sh --prefetch   download FTXUI now so the first ./build.sh works
-#                           even without network access.
+# Safe to run at any time; it never creates scaffolding. It can also install
+# the required dev packages on supported distros (apt/dnf/pacman).
 #
-# FTXUI requirements covered here:
-#   - cmake 3.16+            (FetchContent needs it; build.sh uses cmake+make)
-#   - a C++17 compiler        (g++ or clang++)
-#   - git                     (FetchContent clones FTXUI from GitHub; the
-#                              PATCH_COMMAND also runs 'git apply')
-#   - make                    (build.sh compiles with 'make')
-#   - network to github.com   (to download FTXUI on first build)
-#   - mingw-w64               (optional, only for ./build-windows.sh)
+# Usage:
+#   ./setup.sh            check prerequisites (report only)
+#   ./setup.sh --install  also attempt to install missing dev packages
+#   ./setup.sh --prefetch fetch/git dependencies now so the first ./build.sh
+#                         works without network access
+#
+# Flags may be combined, e.g. ./setup.sh -i -p -w
+#   -i / --install    install missing system deps via the distro package manager
+#   -w / --windows    also install the MinGW-w64 cross-compiler
+#   -v / --valgrind   also install valgrind
+#   -p / --prefetch   prefetch FetchContent deps into build/
+#
+# kadath needs:
+#   - cmake 3.20+
+#   - a C++20 compiler (g++ or clang++)
+#   - git            (FetchContent clones imgui/glfw/json from GitHub)
+#   - make           (build.sh compiles with cmake --build)
+#   - X11/GL/GLFW dev headers (Linux): libx11-dev libx11-xcb-dev libxext-dev
+#     libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl1-mesa-dev
+#     libglu1-mesa-dev (libxfixes-dev is pulled automatically but listed too)
+#   - Wayland dev headers (optional, GLFW feature detection): libwayland-dev
+#     wayland-protocols libxkbcommon-dev
+#   - mingw-w64 (optional, for ./build-windows.sh)
+#   - network to github.com (to download deps on first build)
 
 set -e
 
+INSTALL=0
 PREFETCH=0
-case "${1:-}" in
-    "" ) ;;
-    --prefetch|-p) PREFETCH=1 ;;
-    * ) echo "usage: ./setup.sh [--prefetch]"; exit 2 ;;
-esac
+WINDOWS=0
+VALGRIND=0
 
-echo "=== app setup ==="
+for arg in "$@"; do
+    case "$arg" in
+        -i|--install)   INSTALL=1 ;;
+        -p|--prefetch)  PREFETCH=1 ;;
+        -w|--windows)   WINDOWS=1 ;;
+        -v|--valgrind)  VALGRIND=1 ;;
+        *) echo "usage: ./setup.sh [-i|--install] [-p|--prefetch] [-w|--windows] [-v|--valgrind]"; exit 2 ;;
+    esac
+done
 
-# --- cmake -----------------------------------------------------------------
-command -v cmake >/dev/null 2>&1 || { echo "ERROR: cmake is required (3.16+). Install it and try again."; exit 1; }
-CMAKE_VER=$(cmake --version | head -1 | grep -oP '\d+\.\d+')
-if [ "$(printf '%s\n3.16\n' "$CMAKE_VER" | sort -V | head -1)" != "3.16" ]; then
-    echo "ERROR: cmake 3.16+ required (found $CMAKE_VER)"
-    exit 1
+echo "=== kadath setup ==="
+
+# --- package manager --------------------------------------------------------
+PKG_NONE=0
+install_pkgs() {
+    [ "$INSTALL" -eq 1 ] || { echo "    (skipping install; rerun with -i/--install)"; return 0; }
+    echo "    Installing: $*"
+    if command -v apt-get >/dev/null 2>&1; then
+        sudo apt-get update && sudo apt-get install -y "$@"
+    elif command -v dnf >/dev/null 2>&1; then
+        sudo dnf install -y "$@"
+    elif command -v pacman >/dev/null 2>&1; then
+        sudo pacman -S --needed --noconfirm "$@"
+    else
+        echo "    ERROR: no supported package manager (apt/dnf/pacman) - install these manually." >&2
+        PKG_NONE=1
+    fi
+}
+
+# Split on a PATH-like separator so the call sites stay readable.
+install_pkgs_split() {
+    IFS=';' read -r -a _p <<< "$1"
+    install_pkgs "${_p[@]}"
+}
+
+# --- cmake ------------------------------------------------------------------
+if command -v cmake >/dev/null 2>&1; then
+    CMAKE_VER=$(cmake --version | head -1 | grep -oP '\d+\.\d+')
+    if [ "$(printf '%s\n3.20\n' "$CMAKE_VER" | sort -V | head -1)" = "3.20" ] || [ "$CMAKE_VER" = "$(printf '%s\n3.20\n' "$CMAKE_VER" | sort -V | head -1)" ]; then
+        echo "[OK] cmake $CMAKE_VER"
+    else
+        echo "cmake $CMAKE_VER is too old (3.20+ required); installing newer..."
+        if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get install -y cmake ninja-build || true
+        fi
+        echo "      If apt provided an old cmake, install a newer one (pip install cmake) and rerun." >&2
+    fi
+else
+    echo "cmake not found; installing..."
+    install_pkgs_split "cmake;ninja-build"
 fi
-echo "[OK] cmake $CMAKE_VER"
 
-# --- compiler --------------------------------------------------------------
+# --- compiler ---------------------------------------------------------------
 if command -v g++ >/dev/null 2>&1; then
     echo "[OK] g++ $(g++ -dumpversion)"
 elif command -v clang++ >/dev/null 2>&1; then
     echo "[OK] clang++ ($(clang++ --version | head -1))"
 else
-    echo "ERROR: no C++17 compiler found (g++ or clang++)"
-    exit 1
+    echo "No C++20 compiler found; installing g++..."
+    if command -v apt-get >/dev/null 2>&1; then
+        install_pkgs_split "g++;g++-12;build-essential"
+    else
+        install_pkgs_split "gcc-c++;g++"
+    fi
 fi
 
-# --- git (FTXUI is fetched from GitHub and patched with 'git apply') -------
-command -v git >/dev/null 2>&1 || { echo "ERROR: git is required (FTXUI is fetched from GitHub and patched)."; exit 1; }
-echo "[OK] git $(git --version | cut -d' ' -f3)"
+# --- git (deps are fetched from GitHub) -------------------------------------
+if command -v git >/dev/null 2>&1; then
+    echo "[OK] git $(git --version | cut -d' ' -f3)"
+else
+    echo "git not found; installing..."
+    install_pkgs_split "git"
+fi
 
-# --- make (build.sh compiles with 'make') ----------------------------------
-command -v make >/dev/null 2>&1 || { echo "ERROR: make is required (build.sh runs 'make')."; exit 1; }
-echo "[OK] make $(make --version | head -1 | sed 's/^GNU Make //')"
+# --- make -------------------------------------------------------------------
+if command -v make >/dev/null 2>&1; then
+    echo "[OK] make $(make --version | head -1 | sed 's/^GNU Make //')"
+else
+    echo "make not found; installing..."
+    install_pkgs_split "make"
+fi
 
-# --- FTXUI dependency ------------------------------------------------------
-FTXUI_SRC="build/_deps/ftxui-src"
-
-# A checkout counts as present only if it is actually populated (a stale empty
-# directory must not look like a cached dependency).
-ftxui_present() {
-    [ -f "$FTXUI_SRC/CMakeLists.txt" ] || [ -d "$FTXUI_SRC/src" ]
-}
-
-# Report the checked-out version, but only from the checkout's own git repo -
-# `git -C` would otherwise walk up into the project's repo if .git is missing.
-ftxui_version() {
-    if [ -e "$FTXUI_SRC/.git" ] || [ -f "$FTXUI_SRC/.git" ]; then
-        git -C "$FTXUI_SRC" describe --tags --always 2>/dev/null || echo "cached"
-    else
-        echo "cached"
-    fi
-}
-
-if ftxui_present; then
-    echo "[OK] FTXUI $(ftxui_version) (cached in $FTXUI_SRC)"
-elif [ "$PREFETCH" -eq 1 ]; then
-    echo "Prefetching FTXUI dependency (fetch only, no compile)..."
-    # Regenerate CMakeLists.txt from the template, exactly like build.sh does
-    # (keep this block in sync with build.sh / build-windows.sh).
-    source ./config.sh
-    cp CMakeLists.txt.in CMakeLists.txt
-    sed -i "s/<<TARGET_NAME>>/$APP_NAME/g" CMakeLists.txt
-    SOURCES_TMP=$(mktemp)
-    for s in "${SOURCES[@]}"; do
-        echo "    $s" >> "$SOURCES_TMP"
+# --- Linux build headers (X11 + OpenGL + Wayland) ---------------------------
+if [ "$(uname -s)" = "Linux" ]; then
+    missing=""
+    for h in X11/Xlib.h X11/extensions/Xfixes.h GL/gl.h GL/glx.h; do
+        printf '#include <%s>\nint main(){return 0;}\n' "$h" | g++ -x c++ - -o /dev/null >/dev/null 2>&1 || missing="$missing $h"
     done
-    sed -i "/^<<SOURCES>>$/{
-        r $SOURCES_TMP
-        d
-    }" CMakeLists.txt
-    rm -f "$SOURCES_TMP"
-    for lib in "${LIBS[@]}"; do
-        if [[ "$lib" == *::* ]]; then
-            echo "target_link_libraries($APP_NAME PRIVATE $lib)" >> CMakeLists.txt
+    for h in wayland-client.h xkbcommon.h; do
+        printf '#include <%s>\nint main(){return 0;}\n' "$h" | g++ -x c++ - -o /dev/null >/dev/null 2>&1 || missing="$missing $h"
+    done
+    if [ -n "$missing" ]; then
+        echo "Missing dev headers:$missing"
+        install_pkgs_split "libx11-dev;libx11-xcb-dev;libxext-dev;libxrandr-dev;libxinerama-dev;libxcursor-dev;libxi-dev;libxfixes-dev;libgl1-mesa-dev;libwayland-dev;wayland-protocols;libxkbcommon-dev"
+    else
+        echo "[OK] X11/OpenGL/Wayland dev headers present"
+    fi
+fi
+
+# --- FetchContent metadata (fetch only, no compile) -------------------------
+if [ "$PREFETCH" -eq 1 ]; then
+    echo "Prefetching dependencies (imgui/glfw/json)..."
+    source ./config.sh
+    source ./generate-cmake.sh
+    generate_cmake CMakeLists.txt
+    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/dev/null
+    _deps="build/_deps"
+    for d in imgui glfw json; do
+        if [ -f "$_deps/${d}-src/CMakeLists.txt" ]; then
+            echo "[OK] $d fetched into $_deps/${d}-src"
         else
-            echo "target_link_libraries($APP_NAME PRIVATE \${CMAKE_SOURCE_DIR}/$lib)" >> CMakeLists.txt
+            echo "WARNING: $d did not land in $_deps/${d}-src - check network." >&2
         fi
     done
-    mkdir -p build
-    # Clear any stale/empty checkout so FetchContent's download step can clone
-    # fresh (git clone refuses an existing non-empty directory).
-    rm -rf "$FTXUI_SRC"
-    cmake -S . -B build
-    if ftxui_present; then
-        echo "[OK] FTXUI $(ftxui_version) fetched into $FTXUI_SRC"
-    else
-        echo "WARNING: FTXUI fetch did not produce $FTXUI_SRC - check network and rerun."
-    fi
 else
-    echo "FTXUI not fetched yet - it will be downloaded on first ./build.sh (needs network)."
-    echo "  To fetch it now:  ./setup.sh --prefetch"
+    echo "Dependencies (imgui/glfw/json) will be downloaded on first ./build.sh (needs network)."
+    echo "  To fetch them now:  ./setup.sh --prefetch"
 fi
 
-# --- Windows cross-build (optional) ----------------------------------------
+# --- Windows cross-build (optional) -----------------------------------------
 if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
     echo "[OK] MinGW-w64 cross-compiler (Windows builds supported)"
+elif [ "$WINDOWS" -eq 1 ]; then
+    echo "Installing MinGW-w64 cross-compiler..."
+    install_pkgs_split "mingw-w64"
+    if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+        echo "[OK] MinGW-w64 installed"
+    fi
 else
     echo "MinGW-w64 not found - Windows builds (./build-windows.sh) will fail."
-    echo "  Install it with:  sudo apt install -y mingw-w64"
+    echo "  Install it with:  sudo apt install -y mingw-w64  (or ./setup.sh -w)"
+fi
+
+# --- valgrind (optional) ----------------------------------------------------
+if command -v valgrind >/dev/null 2>&1; then
+    echo "[OK] valgrind"
+elif [ "$VALGRIND" -eq 1 ]; then
+    echo "Installing valgrind..."
+    install_pkgs_split "valgrind"
 fi
 
 echo ""
 echo "=== Setup complete ==="
 echo "Run ./build.sh to build."
-    
