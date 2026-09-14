@@ -13,7 +13,7 @@ using namespace kadath;
 
 namespace {
 int g_failures = 0     ;;
-void check(bool ok) { if (!ok) ++g_failures; }
+void check(bool ok) { if (!ok) { ++g_failures; std::printf("check failed (line %d)\n", __LINE__); } }
 void checkEq(Action got, Action want) {
     if (got != want) { ++g_failures; std::printf("action mismatch: %s vs %s\n", actionName(got), actionName(want)); }
 }
